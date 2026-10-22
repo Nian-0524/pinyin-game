@@ -10026,39 +10026,95 @@ function plainOf(item) {
        · 要换话时，先把旧句子音量调成 0（听不见，但它照常瞬间走完）
        · 新句子立刻 speak 排队，等旧句子"哑着"结束就马上开始
      代价是每句有极短的交接，但避免了引擎重置和错位。 */
+/* 平台判定：安卓 / iOS 的语音引擎差异很大，需要分别处理 */
+const UA = navigator.userAgent || '';
+const ANDROID = /Android/i.test(UA);
+const IOS = /iPad|iPhone|iPod/.test(UA) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+/* 微信 / QQ 内置浏览器：WebView 内核，语音限制最多 */
+const IN_APP = /MicroMessenger|QQ\/|Weibo|AlipayClient/i.test(UA);
+
 const Voice = {
   zhVoice: null, muted: false, rate: 1.5, _live: [], _ready: false, _tok: 0, _endAt: 0,
+  _noZh: false,
 
   init() {
     if (!('speechSynthesis' in window)) return;
+
+    /* 不只看语言的写法，名称里带"中文/普通话"的也算 —— 安卓各家的写法五花八门 */
+    const isZh = v => /^zh|cmn|yue/i.test(v.lang || '') || /中文|普通话|汉语|Chinese|Mandarin/i.test(v.name || '');
+
     const load = () => {
-      const vs = speechSynthesis.getVoices();
+      /* 安卓 WebView 偶发 getVoices 抛异常，必须包起来，否则整个初始化中断 */
+      let vs = [];
+      try { vs = speechSynthesis.getVoices() || []; } catch (e) { return; }
       if (!vs.length) return;
-      const zh = vs.filter(v => /^zh|cmn/i.test(v.lang));
+      const zh = vs.filter(isZh);
+      /* 一个中文音色都没有：说明这台设备的系统 TTS 没装中文包，
+         记下来给界面提示用（而不是死等） */
+      if (!zh.length) { this.zhVoice = null; this._noZh = true; return; }
+
       const score = v => {
         let s = 0;
-        if (/zh[-_]CN/i.test(v.lang)) s += 30;
+        if (/zh[-_]CN/i.test(v.lang || '')) s += 30;
         /* 各平台念汉字最准的几家系统音 */
-        if (/xiaoxiao|yunxi|xiaoyi|yunyang|tingting|meijia|huihui|kangkang|google/i.test(v.name)) s += 20;
-        if (/Microsoft|Google|Apple/i.test(v.name)) s += 10;
-        if (/localService/i.test(v.name)) s -= 20;
-        if (v.localService === false) s += 8;
+        if (/xiaoxiao|yunxi|xiaoyi|yunyang|tingting|meijia|huihui|kangkang/i.test(v.name || '')) s += 22;
+        if (/google|Microsoft|Apple/i.test(v.name || '')) s += 10;
+        /* 安卓常见 TTS：Google 语音服务 / 三星 / 小米 / 华为 / 讯飞 */
+        if (/google|samsung|xiaomi|huawei|iflytek|讯飞|三星|华为|小米/i.test(v.name || '')) s += 14;
+        /* 老逻辑把本地音色扣了 20 分，但那会让安卓的离线引擎被排到后面，
+           而安卓恰恰是"离线中文音色"最稳 —— 只轻微降权 */
+        if (/localService/i.test(v.name || '')) s -= 4;
+        if (v.localService === false) s += 6;
         return s;
       };
-      this.zhVoice = zh.sort((a, b) => score(b) - score(a))[0] || null;
+      const sorted = zh.slice().sort((a, b) => score(b) - score(a));
+      /* 优先挑能在本机直接合成的（安卓上远程音色经常不出声） */
+      this.zhVoice = sorted.find(v => v.localService) || sorted[0] || null;
+      this._noZh = false;
     };
+
     load();
-    speechSynthesis.onvoiceschanged = load;
+    try { speechSynthesis.onvoiceschanged = load; } catch (e) {}
+
+    /* 手机浏览器首次 getVoices() 往往是空数组，列表要过一会儿才回来。
+       iOS 一般 1 秒内就绪；安卓 WebView（微信内置）可能要 3~5 秒，所以拉长重试窗口。 */
+    let tries = 0;
+    const retry = setInterval(() => {
+      load();
+      if (this.zhVoice || ++tries > 14) clearInterval(retry);
+    }, 400);
+
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden && speechSynthesis.paused) speechSynthesis.resume();
+      if (!document.hidden) {
+        try { if (speechSynthesis.paused) speechSynthesis.resume(); } catch (e) {}
+        if (!this.zhVoice) load();
+      }
     });
+    window.addEventListener('focus', () => { if (!this.zhVoice) load(); });
   },
 
-  /* 用户手势里调用一次，确保引擎处于可发声状态 */
+  /* 用户手势里调用一次，确保引擎处于可发声状态。
+     手机浏览器要求"第一句必须在用户动作里发出"，否则后面全都静音；
+     桌面浏览器本来就允许直接说话，这里只是再 resume 一下，没有副作用。 */
   prime() {
-    if (this._ready || !('speechSynthesis' in window)) return;
-    this._ready = true;
-    try { if (speechSynthesis.paused) speechSynthesis.resume(); } catch (e) {}
+    if (!('speechSynthesis' in window)) return;
+    try {
+      const syn = speechSynthesis;
+      if (syn.paused) syn.resume();
+      if (this._ready) {
+        /* 有些安卓机挂后台回来会卡住，补一次 resume */
+        if (!syn.speaking && !syn.pending && syn.paused) syn.resume();
+        return;
+      }
+      this._ready = true;
+      /* 用一句极短、几乎听不见的音把通道打开（空格 + 极低音量） */
+      const u = new SpeechSynthesisUtterance('啊');
+      u.lang = 'zh-CN';
+      u.volume = 0.001;
+      u.rate = 2;
+      if (this.zhVoice) u.voice = this.zhVoice;
+      syn.speak(u);
+    } catch (e) {}
   },
 
   /* 静音手上所有句子，但不打断引擎（关键：不 cancel） */
@@ -10082,8 +10138,11 @@ const Voice = {
     try {
       if (syn.paused) syn.resume();
       const u = new SpeechSynthesisUtterance(text);
+      /* 安卓的 rate 感知比 iOS / Windows 慢半拍，同样 1.5 会显得拖沓，这里补一点；
+         同时安卓对 rate<0.5 容易吞音，1.2 是下限 */
       u.lang = 'zh-CN';
-      u.rate = rate || this.rate;
+      const base = rate || this.rate;
+      u.rate = ANDROID ? Math.min(2, base * 1.12) : base;
       u.pitch = 1.02;
       u.volume = 1;
       if (this.zhVoice) u.voice = this.zhVoice;
@@ -11662,6 +11721,41 @@ document.getElementById('btnSound').addEventListener('click', e => {
   e.currentTarget.classList.toggle('off', Voice.muted);
   if (!Voice.muted) Voice.speak('声音已打开');
 });
+
+/* 长按喇叭 = 声音自检。
+   手机上分不清"静音键 / 没装中文语音包 / 浏览器拦了"，这里一次性告诉用户是哪一种。 */
+(function bindSoundCheck() {
+  const btn = document.getElementById('btnSound');
+  let timer = 0;
+  const start = () => {
+    timer = setTimeout(() => {
+      timer = 0;
+      const lines = [];
+      lines.push('系统：' + (ANDROID ? '安卓' : IOS ? 'iOS' : '电脑') + (IN_APP ? '（App 内置浏览器）' : ''));
+      const zh = Voice.zhVoice;
+      lines.push('中文语音：' + (zh ? '✅ ' + zh.name : '❌ 没找到'));
+      /* 安卓有个独特的坑：不装 Google TTS / 系统语音服务缺失，getVoices 会是空的 */
+      if (!zh && ANDROID) {
+        lines.push('安卓请到「设置 → 系统 → 语言和输入 → 文字转语音」确认已安装并启用语音引擎（如 Google 语音服务），并下载中文语音数据。');
+      }
+      if (!zh && IOS) lines.push('iPhone 请到「设置 → 辅助功能 → 朗读内容 → 声音 → 中文」下载中文语音。');
+      if (IN_APP) lines.push('App 内置浏览器限制较多，建议点右上角「…」选择「在浏览器中打开」。');
+      if (zh) lines.push('如果你听不到声音，请检查：①手机侧面静音键 ②媒体音量 ③App 内静音开关');
+      alert('声音自检\n\n' + lines.join('\n'));
+      /* 顺便真读一句，让用户直接听到 */
+      Voice.prime();
+      setTimeout(() => Voice.speak('声音检测，一二三四'), 120);
+    }, 650);
+  };
+  const cancel = () => { if (timer) { clearTimeout(timer); timer = 0; } };
+  btn.addEventListener('touchstart', start, { passive: true });
+  btn.addEventListener('touchend', cancel);
+  btn.addEventListener('touchmove', cancel);
+  btn.addEventListener('mousedown', start);
+  btn.addEventListener('mouseup', cancel);
+  btn.addEventListener('mouseleave', cancel);
+  btn.addEventListener('contextmenu', e => e.preventDefault());
+})();
 document.getElementById('btnHistory').addEventListener('click', () => {
   histTab = 'all';
   renderHistory();
